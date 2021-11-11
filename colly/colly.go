@@ -2,12 +2,16 @@ package colly
 
 import (
 	"avtb/storage"
+	"bytes"
 	"context"
 	"errors"
+	"hash/fnv"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -129,7 +133,7 @@ func (c *Collector) Visit(url string) error {
 	return c.scrape(url, http.MethodGet, 1, nil, nil, nil, true)
 }
 
-func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, ctx *context.Context,
+func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, ctx *Context,
 	hdr http.Header, checkRevisit bool) error {
 
 	parsedUrl, err := url.Parse(u)
@@ -139,6 +143,53 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 
 	if err := c.requestCheck(u, parsedUrl, method, requestData, depth, checkRevisit); err != nil {
 		return err
+	}
+
+	if hdr == nil {
+		hdr = http.Header{}
+	}
+
+	if _, ok := hdr["User-Agent"]; !ok {
+		hdr.Set("User-Agent", c.UserAgent)
+	}
+
+	rc, ok := requestData.(io.ReadCloser)
+	if !ok && requestData != nil {
+		rc = ioutil.NopCloser(requestData)
+	}
+	host := parsedUrl.Host
+
+	if hostHeader := hdr.Get("Host"); hostHeader != "" {
+		host = hostHeader
+	}
+	req := &http.Request{
+		Method:     method,
+		URL:        parsedUrl,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     hdr,
+		Body:       rc,
+		Host:       host,
+	}
+	req = req.WithContext(c.Context)
+	setRequestBody(req, requestData)
+	u = parsedUrl.String()
+	c.wg.Add(1)
+	if c.Asyns {
+		go c.fetch(u, method, depth, requestData, ctx, hdr, req)
+		return nil
+	}
+	return c.fetch(u, method, depth, requestData, ctx, hdr, req)
+
+}
+
+func (c *Collector) fetch(u, method string, depth int, requestData io.Reader,
+	ctx *Context, hdr http.Header, req *http.Request) error {
+	defer c.wg.Done()
+	if ctx == nil {
+		ctx = NewContext()
+
 	}
 
 	return nil
@@ -167,7 +218,22 @@ func (c *Collector) requestCheck(u string, parsedURL *url.URL, method string,
 	}
 
 	if checkRevisit && !c.AllowURLRevisit {
-
+		h := fnv.New64a()
+		h.Write([]byte(u))
+		var uHash uint64
+		if method == "GET" {
+			uHash = h.Sum64()
+		} else if requestData != nil {
+			h.Write(streamToByte(requestData))
+			uHash = h.Sum64()
+		} else {
+			return nil
+		}
+		visited := c.storage.IsVist(uHash)
+		if visited {
+			return ErrAlreadyVisited
+		}
+		return nil
 	}
 
 	return nil
@@ -180,4 +246,49 @@ func isMatchingFilter(fs []*regexp.Regexp, b []byte) bool {
 		}
 	}
 	return false
+}
+
+func setRequestBody(req *http.Request, body io.Reader) {
+	if body != nil {
+		switch v := body.(type) {
+		case *bytes.Buffer:
+			req.ContentLength = int64(v.Len())
+			buf := v.Bytes()
+			req.GetBody = func() (io.ReadCloser, error) {
+				r := bytes.NewReader(buf)
+				return ioutil.NopCloser(r), nil
+			}
+		case *bytes.Reader:
+			req.ContentLength = int64(v.Len())
+			snapshot := *v
+			req.GetBody = func() (io.ReadCloser, error) {
+				r := snapshot
+				return ioutil.NopCloser(&r), nil
+			}
+		case *strings.Reader:
+			req.ContentLength = int64(v.Len())
+			snapshot := *v
+			req.GetBody = func() (io.ReadCloser, error) {
+				r := snapshot
+				return ioutil.NopCloser(&r), nil
+			}
+		}
+		if req.GetBody != nil && req.ContentLength == 0 {
+			req.Body = http.NoBody
+			req.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
+		}
+	}
+}
+
+func streamToByte(r io.Reader) []byte {
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(r)
+
+	if strReader, k := r.(*strings.Reader); k {
+		strReader.Seek(0, 0)
+	} else if bReader, kb := r.(*bytes.Reader); kb {
+		bReader.Seek(0, 0)
+	}
+
+	return buf.Bytes()
 }
