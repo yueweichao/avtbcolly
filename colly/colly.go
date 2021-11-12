@@ -27,6 +27,7 @@ var (
 	ErrAlreadyVisited    = errors.New("URL already visited")
 )
 
+type RequestCallBack func(*Request)
 type CollectorOption func(c *Collector)
 
 type Collector struct {
@@ -40,9 +41,12 @@ type Collector struct {
 	AllowURLRevisit      bool
 	ID                   uint32
 	MaxDepth             int
+	TraceHTTP            bool
+	requestCallBack      []RequestCallBack
 	storage              *storage.InMemoryStorage
 	wg                   *sync.WaitGroup
 	lock                 *sync.RWMutex
+	requestCount         uint32
 }
 
 func MaxDepth(depth int) CollectorOption {
@@ -93,14 +97,14 @@ func AllowedDomains(domains ...string) CollectorOption {
 	}
 }
 
-func NewCollector(options ...CollectorOption) *Collector {
-	c := &Collector{}
-	c.Init()
-	for _, f := range options {
-		f(c)
-	}
-	return c
-}
+//func NewCollector(options ...CollectorOption) *Collector {
+//	c := &Collector{}
+//	c.Init()
+//	for _, f := range options {
+//		f(c)
+//	}
+//	return c
+//}
 
 func (c *Collector) isDomainAllowed(domain string) bool {
 	for _, d2 := range c.DisallowedDomains {
@@ -124,6 +128,9 @@ func (c *Collector) isDomainAllowed(domain string) bool {
 func (c *Collector) Init() {
 	c.wg = &sync.WaitGroup{}
 	c.lock = &sync.RWMutex{}
+	c.TraceHTTP = false
+	c.storage = &storage.InMemoryStorage{}
+	c.storage.Init()
 
 	c.Context = context.Background()
 	c.ID = atomic.AddUint32(&collectorCounter, 1)
@@ -189,7 +196,29 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader,
 	defer c.wg.Done()
 	if ctx == nil {
 		ctx = NewContext()
+	}
+	request := &Request{
+		URL:       req.URL,
+		Headers:   &req.Header,
+		Ctx:       ctx,
+		Depth:     depth,
+		Method:    method,
+		Body:      requestData,
+		collector: c,
+		ID:        atomic.AddUint32(&c.requestCount, 1),
+	}
+	c.handleOnRequest(request)
 
+	if request.abort {
+		return nil
+	}
+
+	if method == "POST" && req.Header.Get("Content-Type") == "" {
+		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	}
+
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "*/*")
 	}
 
 	return nil
@@ -237,6 +266,12 @@ func (c *Collector) requestCheck(u string, parsedURL *url.URL, method string,
 	}
 
 	return nil
+}
+
+func (c *Collector) handleOnRequest(r *Request) {
+	for _, f := range c.requestCallBack {
+		f(r)
+	}
 }
 
 func isMatchingFilter(fs []*regexp.Regexp, b []byte) bool {
